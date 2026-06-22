@@ -1,0 +1,58 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "product_id",
+          "name",
+          "brand",
+          "color",
+          "current_price_czk",
+          "full_price_czk",
+          "in_stock",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "product_id": {
+            "label": "Product ID",
+            "format": "text"
+          },
+          "name": {
+            "label": "Product Name",
+            "format": "text"
+          },
+          "brand": {
+            "label": "Brand",
+            "format": "text"
+          },
+          "color": {
+            "label": "Color",
+            "format": "text"
+          },
+          "current_price_czk": {
+            "label": "Current Price (CZK)",
+            "format": "text"
+          },
+          "full_price_czk": {
+            "label": "Full Price (CZK)",
+            "format": "text"
+          },
+          "in_stock": {
+            "label": "In Stock",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
