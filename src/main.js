@@ -86,6 +86,52 @@ function getConfiguredProxyGroups(proxyConfiguration) {
     return [];
 }
 
+function buildBrowserProxyOptions(proxyUrl) {
+    if (!proxyUrl) return undefined;
+
+    const parsedProxyUrl = new URL(proxyUrl);
+    const proxy = {
+        server: `${parsedProxyUrl.protocol}//${parsedProxyUrl.host}`,
+    };
+
+    if (parsedProxyUrl.username) proxy.username = decodeURIComponent(parsedProxyUrl.username);
+    if (parsedProxyUrl.password) proxy.password = decodeURIComponent(parsedProxyUrl.password);
+
+    return proxy;
+}
+
+function isBrowserCrashError(error) {
+    return /Target crashed|Target page, context or browser has been closed|Browser has been closed/iu.test(
+        String(error?.message || error),
+    );
+}
+
+async function createBrowserSession(proxy) {
+    const profileDirectory = await mkdtemp(join(tmpdir(), 'zoot-patchright-'));
+    let context;
+
+    try {
+        context = await chromium.launchPersistentContext(profileDirectory, {
+            channel: 'chrome',
+            headless: false,
+            noViewport: true,
+            ...(proxy && { proxy }),
+        });
+        const page = await context.newPage();
+        return { context, page, profileDirectory };
+    } catch (error) {
+        await context?.close().catch(() => {});
+        await rm(profileDirectory, { recursive: true, force: true });
+        throw error;
+    }
+}
+
+async function closeBrowserSession(session) {
+    await session?.page?.close().catch(() => {});
+    await session?.context?.close().catch(() => {});
+    await rm(session?.profileDirectory, { recursive: true, force: true });
+}
+
 function buildPageUrl(startUrl, pageNumber) {
     if (pageNumber === 1) return startUrl;
 
@@ -425,14 +471,9 @@ async function main() {
     const browserProxyUrl = proxyConfiguration
         ? await proxyConfiguration.newUrl(residentialSessionId)
         : undefined;
-    const browserProfileDirectory = await mkdtemp(join(tmpdir(), 'zoot-patchright-'));
-    const context = await chromium.launchPersistentContext(browserProfileDirectory, {
-        channel: 'chrome',
-        headless: false,
-        noViewport: true,
-        ...(browserProxyUrl && { proxy: { server: browserProxyUrl } }),
-    });
-    const page = await context.newPage();
+    const browserProxy = buildBrowserProxyOptions(browserProxyUrl);
+    let browserSession = await createBrowserSession(browserProxy);
+    let { page } = browserSession;
 
     const seenProductKeys = new Set();
     let savedCount = 0;
@@ -450,7 +491,18 @@ async function main() {
 
         let html;
         try {
-            html = await fetchHtml(page, buildPageUrl(startUrl, pageNumber));
+            const pageUrl = buildPageUrl(startUrl, pageNumber);
+            try {
+                html = await fetchHtml(page, pageUrl);
+            } catch (error) {
+                if (!isBrowserCrashError(error)) throw error;
+
+                log.warning(`Browser target crashed on page ${pageNumber}; restarting the browser once.`);
+                await closeBrowserSession(browserSession);
+                browserSession = await createBrowserSession(browserProxy);
+                page = browserSession.page;
+                html = await fetchHtml(page, pageUrl);
+            }
         } catch (error) {
             log.error(`Listing request failed on page ${pageNumber}: ${error.message}`);
             break;
@@ -545,9 +597,7 @@ async function main() {
 
         log.info(`Extraction complete. Saved ${savedCount} products.`);
     } finally {
-        await page.close();
-        await context.close();
-        await rm(browserProfileDirectory, { recursive: true, force: true });
+        await closeBrowserSession(browserSession);
     }
 }
 
