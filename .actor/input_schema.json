@@ -40,7 +40,7 @@
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "ApifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": ["RESIDENTIAL"]
       }
     }
   },

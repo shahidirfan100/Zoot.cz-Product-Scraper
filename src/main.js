@@ -70,6 +70,16 @@ function getInputMode(url, keyword) {
     return undefined;
 }
 
+function normalizeProxyConfiguration(proxyConfiguration) {
+    if (!proxyConfiguration || Array.isArray(proxyConfiguration.apifyProxyGroups)
+        || !Array.isArray(proxyConfiguration.ApifyProxyGroups)) {
+        return proxyConfiguration;
+    }
+
+    const { ApifyProxyGroups, ...normalized } = proxyConfiguration;
+    return { ...normalized, apifyProxyGroups: ApifyProxyGroups };
+}
+
 function getConfiguredProxyGroups(proxyConfiguration) {
     if (Array.isArray(proxyConfiguration?.groups)) return proxyConfiguration.groups;
     if (Array.isArray(proxyConfiguration?.apifyProxyGroups)) return proxyConfiguration.apifyProxyGroups;
@@ -391,7 +401,7 @@ async function main() {
     }
 
     const startUrl = buildStartUrl({ url, keyword });
-    const proxyConfigurationInput = input.proxyConfiguration;
+    const proxyConfigurationInput = normalizeProxyConfiguration(input.proxyConfiguration);
     const isApifyCloud = Actor.isAtHome();
     const hasCustomProxyUrls = Array.isArray(proxyConfigurationInput?.proxyUrls)
         && proxyConfigurationInput.proxyUrls.length > 0;
