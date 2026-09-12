@@ -39,8 +39,7 @@
       "description": "Use Apify Proxy (recommended: residential) to avoid blocks.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "useApifyProxy": false
       }
     }
   },
