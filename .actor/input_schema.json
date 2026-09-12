@@ -15,8 +15,7 @@
       "title": "Search Keyword",
       "type": "string",
       "description": "Search keyword if not using a direct URL. Ignored when URL is provided.",
-      "editor": "textfield",
-      "prefill": "shirt"
+      "editor": "textfield"
     },
     "results_wanted": {
       "title": "Maximum Results",

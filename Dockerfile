@@ -1,15 +1,13 @@
-FROM alpine:latest
+FROM apify/actor-node-playwright-chrome:22
 
-RUN apk add --no-cache nodejs npm
+COPY --chown=myuser:myuser package*.json ./
 
-RUN addgroup app && adduser app -G app -D
-WORKDIR /home/app
-USER app
+RUN npm --quiet set progress=false \
+    && npm install --omit=dev \
+    && node -e "import('patchright').then(m => console.log('patchright OK:', Object.keys(m)))" \
+    && rm -rf ~/.npm
 
-COPY --chown=app:app package*.json ./
-RUN npm i --omit=dev && rm -r ~/.npm || true
-
-COPY --chown=app:app . ./
+COPY --chown=myuser:myuser . ./
 
 ENV APIFY_LOG_LEVEL=INFO
 

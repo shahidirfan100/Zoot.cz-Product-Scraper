@@ -1,17 +1,17 @@
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
-import { gotScraping } from 'got-scraping';
+import { chromium } from 'patchright';
 
 const BASE_URL = 'https://www.zoot.cz';
 const REQUEST_TIMEOUT_MS = 30000;
+const MAX_REQUEST_RETRIES = 3;
+const MAX_RETRY_DELAY_MS = 5000;
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 20;
-const DEFAULT_HEADERS = {
-    'accept-language': 'en-US,en;q=0.9,cs;q=0.8',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-};
 
 await Actor.init();
 
@@ -53,14 +53,35 @@ function normalizeStartUrl(url) {
     return ensureTrailingSlash(absolute.toString());
 }
 
+function normalizeInputValue(value) {
+    if (typeof value !== 'string') return '';
+    return value.trim();
+}
+
 function buildStartUrl({ url, keyword }) {
     if (url) return normalizeStartUrl(url);
     if (keyword) return `${BASE_URL}/vyhledavani/hledani:${buildKeywordPath(keyword)}/`;
     throw new Error('Missing required input: provide either "url" or "keyword".');
 }
 
+function getInputMode(url, keyword) {
+    if (url) return 'url';
+    if (keyword) return 'keyword';
+    return undefined;
+}
+
+function getConfiguredProxyGroups(proxyConfiguration) {
+    if (Array.isArray(proxyConfiguration?.groups)) return proxyConfiguration.groups;
+    if (Array.isArray(proxyConfiguration?.apifyProxyGroups)) return proxyConfiguration.apifyProxyGroups;
+    return [];
+}
+
 function buildPageUrl(startUrl, pageNumber) {
-    return pageNumber === 1 ? startUrl : `${startUrl}strana:${pageNumber}/`;
+    if (pageNumber === 1) return startUrl;
+
+    const pageUrl = new URL(startUrl);
+    pageUrl.pathname = `${pageUrl.pathname.replace(/\/$/u, '')}/strana:${pageNumber}/`;
+    return pageUrl.toString();
 }
 
 function cleanText(value) {
@@ -252,21 +273,100 @@ function buildRecord({
     });
 }
 
-async function fetchHtml(url, proxyConfiguration) {
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-    const response = await gotScraping({
-        url,
-        proxyUrl,
-        headers: DEFAULT_HEADERS,
-        timeout: {
-            request: REQUEST_TIMEOUT_MS,
-        },
-        retry: {
-            limit: 2,
-        },
-    });
+function isRetryableError(error) {
+    if (error?.retryable !== undefined) return error.retryable;
 
-    return response.body;
+    return [
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'EAI_AGAIN',
+        'ENETUNREACH',
+        'EPIPE',
+        'ETIMEDOUT',
+        'ESOCKETTIMEDOUT',
+    ].includes(error?.code) || error?.name === 'TimeoutError';
+}
+
+function getRetryAfterMs(value) {
+    if (!value) return undefined;
+
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
+    }
+
+    const dateMs = Date.parse(value);
+    return Number.isNaN(dateMs) ? undefined : Math.min(Math.max(dateMs - Date.now(), 0), MAX_RETRY_DELAY_MS);
+}
+
+function getBackoffDelayMs(attempt) {
+    const baseDelay = Math.min(1000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
+    return Math.floor(baseDelay * (0.5 + Math.random() * 0.5));
+}
+
+async function fetchHtml(page, url) {
+    for (let attempt = 1; attempt <= MAX_REQUEST_RETRIES + 1; attempt++) {
+        try {
+            const response = await page.goto(url, {
+                waitUntil: 'domcontentloaded',
+                timeout: REQUEST_TIMEOUT_MS,
+            });
+            const statusCode = response?.status();
+
+            if (!Number.isInteger(statusCode) || statusCode < 200 || statusCode >= 300) {
+                const requestError = new Error(`HTTP ${statusCode || 'unknown'} response`);
+                requestError.retryable = statusCode === 429 || statusCode >= 500;
+                requestError.retryAfterMs = getRetryAfterMs(response?.headers()?.['retry-after']);
+                throw requestError;
+            }
+
+            let body;
+            try {
+                await page.waitForFunction(
+                    () => {
+                        const html = document.documentElement?.outerHTML || '';
+                        return html.includes('dataLayer') && !html.includes('/.within.website/');
+                    },
+                    { timeout: REQUEST_TIMEOUT_MS },
+                );
+                try {
+                    await page.waitForLoadState('networkidle', { timeout: REQUEST_TIMEOUT_MS });
+                } catch {
+                    log.warning('Listing page did not reach network idle before the timeout.');
+                }
+                body = await page.content();
+            } catch {
+                body = await page.content();
+                const challengeError = new Error(
+                    body.includes('/.within.website/')
+                        ? 'Target anti-bot challenge did not complete in the browser'
+                        : 'Listing payload did not load in the browser',
+                );
+                challengeError.retryable = body.includes('/.within.website/');
+                throw challengeError;
+            }
+
+            if (!body.trim()) {
+                const responseError = new Error('Empty or invalid HTML response');
+                responseError.retryable = false;
+                throw responseError;
+            }
+
+            return body;
+        } catch (error) {
+            if (!isRetryableError(error) || attempt > MAX_REQUEST_RETRIES) throw error;
+
+            const delayMs = error.retryAfterMs ?? getBackoffDelayMs(attempt);
+            log.warning(`Retrying listing request ${attempt}/${MAX_REQUEST_RETRIES} after ${delayMs}ms`, {
+                reason: error.message,
+            });
+            await new Promise((resolve) => {
+                setTimeout(resolve, delayMs);
+            });
+        }
+    }
+
+    throw new Error('Listing request retry limit exhausted.');
 }
 
 async function main() {
@@ -280,37 +380,67 @@ async function main() {
         }
     }
 
-    const {
-        url = '',
-        keyword = '',
-        results_wanted,
-        max_pages,
-        proxyConfiguration: proxyConfigurationInput,
-    } = input;
+    const url = normalizeInputValue(input.url);
+    const keyword = normalizeInputValue(input.keyword);
+    const resultsWanted = toPositiveInteger(input.results_wanted, DEFAULT_RESULTS_WANTED);
+    const maxPages = toPositiveInteger(input.max_pages, DEFAULT_MAX_PAGES);
+    const inputMode = getInputMode(url, keyword);
 
-    const resultsWanted = toPositiveInteger(results_wanted, DEFAULT_RESULTS_WANTED);
-    const maxPages = toPositiveInteger(max_pages, DEFAULT_MAX_PAGES);
+    if (url && keyword) {
+        log.warning('Both "url" and "keyword" were provided; using the URL search mode.');
+    }
+
     const startUrl = buildStartUrl({ url, keyword });
-    const proxyConfiguration = proxyConfigurationInput
-        ? await Actor.createProxyConfiguration(proxyConfigurationInput)
+    const proxyConfigurationInput = input.proxyConfiguration;
+    const isApifyCloud = Actor.isAtHome();
+    const hasCustomProxyUrls = Array.isArray(proxyConfigurationInput?.proxyUrls)
+        && proxyConfigurationInput.proxyUrls.length > 0;
+    const configuredGroups = getConfiguredProxyGroups(proxyConfigurationInput);
+    const requestedApifyProxy = proxyConfigurationInput?.useApifyProxy === true || configuredGroups.length > 0;
+
+    let proxyConfiguration;
+    if (proxyConfigurationInput && hasCustomProxyUrls) {
+        proxyConfiguration = await Actor.createProxyConfiguration(proxyConfigurationInput);
+    } else if (proxyConfigurationInput && requestedApifyProxy && isApifyCloud) {
+        proxyConfiguration = await Actor.createProxyConfiguration(proxyConfigurationInput);
+    } else if (requestedApifyProxy && !isApifyCloud) {
+        log.info('Local run detected: ignoring Apify Proxy settings.');
+    }
+
+    const usesUnblocker = configuredGroups.includes('UNBLOCKER');
+    const usesResidential = configuredGroups.includes('RESIDENTIAL');
+    const residentialSessionId = usesResidential && !usesUnblocker
+        ? `zoot_${Date.now()}`
         : undefined;
+    const browserProxyUrl = proxyConfiguration
+        ? await proxyConfiguration.newUrl(residentialSessionId)
+        : undefined;
+    const browserProfileDirectory = await mkdtemp(join(tmpdir(), 'zoot-patchright-'));
+    const context = await chromium.launchPersistentContext(browserProfileDirectory, {
+        channel: 'chrome',
+        headless: false,
+        noViewport: true,
+        ...(browserProxyUrl && { proxy: { server: browserProxyUrl } }),
+    });
+    const page = await context.newPage();
 
     const seenProductKeys = new Set();
     let savedCount = 0;
 
     log.info('Starting ZOOT.cz extraction', {
-        inputMode: url ? 'url' : 'keyword',
+        inputMode,
         resultsWanted,
         maxPages,
         proxyEnabled: Boolean(proxyConfiguration),
     });
 
-    for (let pageNumber = 1; pageNumber <= maxPages && savedCount < resultsWanted; pageNumber++) {
+    try {
+        for (let pageNumber = 1; pageNumber <= maxPages && savedCount < resultsWanted; pageNumber++) {
         log.info(`Fetching listing page ${pageNumber}`);
 
         let html;
         try {
-            html = await fetchHtml(buildPageUrl(startUrl, pageNumber), proxyConfiguration);
+            html = await fetchHtml(page, buildPageUrl(startUrl, pageNumber));
         } catch (error) {
             log.error(`Listing request failed on page ${pageNumber}: ${error.message}`);
             break;
@@ -324,12 +454,22 @@ async function main() {
             break;
         }
 
-        const listingPayload = dataLayer?.[0] || {};
-        const impressions = listingPayload?.ecommerce?.impressions || [];
+        if (!Array.isArray(dataLayer)) {
+            log.error(`Listing payload on page ${pageNumber} was not an array.`);
+            break;
+        }
+
+        const listingPayload = dataLayer[0] || {};
+        const rawImpressions = listingPayload?.ecommerce?.impressions;
+        const impressions = Array.isArray(rawImpressions) ? rawImpressions : [];
+        if (rawImpressions !== undefined && !Array.isArray(rawImpressions)) {
+            log.warning(`Invalid impressions payload on page ${pageNumber}; expected an array.`);
+        }
+
         const pushDataInfo = extractPushDataInfo(html);
         const productCards = extractProductCards(html);
         const fallbackCategoryPath = Array.isArray(listingPayload.pageCategory) ? listingPayload.pageCategory.join(' / ') : undefined;
-        const fallbackCategoryUrl = !keyword ? startUrl : undefined;
+        const fallbackCategoryUrl = inputMode === 'url' ? startUrl : undefined;
 
         if (!impressions.length) {
             log.info(`No impressions found on page ${pageNumber}. Stopping.`);
@@ -344,15 +484,23 @@ async function main() {
             if (!productKey || seenProductKeys.has(productKey)) continue;
             seenProductKeys.add(productKey);
 
-            const record = buildRecord({
-                impression,
-                listingInfo: pushDataInfo[productKey],
-                card: productCards.get(productKey),
-                pageNumber,
-                fallbackCategoryPath,
-                fallbackCategoryUrl,
-                searchKeyword: keyword,
-            });
+            let record;
+            try {
+                record = buildRecord({
+                    impression,
+                    listingInfo: pushDataInfo[productKey],
+                    card: productCards.get(productKey),
+                    pageNumber,
+                    fallbackCategoryPath,
+                    fallbackCategoryUrl,
+                    searchKeyword: inputMode === 'keyword' ? keyword : undefined,
+                });
+            } catch (error) {
+                log.warning(`Skipping product with an invalid payload on page ${pageNumber}`, {
+                    reason: error.message,
+                });
+                continue;
+            }
 
             if (!record.product_id || !record.name || !record.url) {
                 log.warning(`Skipping incomplete product record on page ${pageNumber}`, {
@@ -383,9 +531,14 @@ async function main() {
             log.info('Reached the last listing page.');
             break;
         }
-    }
+        }
 
-    log.info(`Extraction complete. Saved ${savedCount} products.`);
+        log.info(`Extraction complete. Saved ${savedCount} products.`);
+    } finally {
+        await page.close();
+        await context.close();
+        await rm(browserProfileDirectory, { recursive: true, force: true });
+    }
 }
 
 try {

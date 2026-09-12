@@ -71,3 +71,30 @@ No cookies, tokens, or JavaScript-executed headers were required during live ver
 ## HTTP Viability
 
 The actor can stay fully HTTP-based with `gotScraping`. Listing pages alone provide the structured data needed for resilient, high-speed extraction.
+
+## Runtime Revalidation
+
+The original plain-HTTP source was rechecked after ZOOT introduced an Anubis challenge. The challenge returns HTTP 200 and HTML, but it does not contain listing data, so status alone is not treated as a successful extraction.
+
+| Candidate | Request profile | Status/body marker | Required fields | Pagination | Decision |
+|---|---|---:|---|---|---|
+| Listing HTML | impit Chrome | 200, 7,476 bytes, `/.within.website/`, no `dataLayer` | 0 | Not reached | Rejected as blocked |
+| Listing HTML | impit Firefox | 200, 7,429 bytes, `/.within.website/`, no `dataLayer` | 0 | Not reached | Rejected as blocked |
+| Listing HTML | iOS Safari headers | 200, 7,494 bytes, `/.within.website/`, no `dataLayer` | 0 | Not reached | Rejected as blocked |
+| Listing HTML | Android app-style headers | 200, 7,372 bytes, `/.within.website/`, no `dataLayer` | 0 | Not reached | Rejected as blocked |
+| `m.zoot.cz` listing | Direct HTTPS | TLS hostname mismatch | 0 | Unknown | Rejected |
+| `mobile.zoot.cz` listing | Direct HTTPS | TLS hostname mismatch | 0 | Unknown | Rejected |
+| `/_ajax/store_zobrazeni.php` | Browser-observed XHR | 200, empty body | 0 | Not a listing feed | Rejected |
+| Browser-completed listing page | Chrome browser session | `dataLayer`, `pushDataInfo`, 48 product cards | Existing listing fields | `/strana:{page}/` | Selected fallback |
+
+The browser-completed page was the only tested path that returned the required payload markers and product cards. No observed JSON listing endpoint was available to replace the current extraction mapping. The final actor therefore uses a browser fallback only after direct HTTP/API candidates fail, while retaining the existing structured payload parser and pagination behavior.
+
+## Browser Fallback Request Context
+
+- Browser profile: Patchright Chrome persistent context with `channel: 'chrome'`, `headless: false`, and `noViewport: true`.
+- Authentication: None observed.
+- Challenge handling: allow the page JavaScript to complete the observed Anubis challenge within the browser context.
+- Headers: no manually invented browser fingerprint headers.
+- Proxy: pass the configured Apify proxy through to the browser when enabled; keep one proxy identity for the browser context.
+- Session: one browser context is reused across paginated listing requests so challenge cookies and page state remain available.
+- Sensitive values: no cookies, tokens, or response bodies are stored in this discovery document.
