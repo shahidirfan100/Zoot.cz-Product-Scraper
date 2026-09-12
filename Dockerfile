@@ -3,7 +3,7 @@ FROM apify/actor-node-playwright-chrome:22
 COPY --chown=myuser:myuser package*.json ./
 
 RUN npm --quiet set progress=false \
-    && npm install --omit=dev \
+    && npm ci --omit=dev --no-audit --no-fund \
     && node -e "import('patchright').then(m => console.log('patchright OK:', Object.keys(m)))" \
     && rm -rf ~/.npm
 
